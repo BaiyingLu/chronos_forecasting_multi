@@ -152,6 +152,7 @@ def evaluate_single_patient(df, patient_name, pipeline, covariates, context_leng
         print(f"    Total points: {len(df)}, Sequences: {n_seqs}")
 
         patient_results = {}
+        per_forecast_by_ctx: dict = {}  # ctx_len -> list of per-step prediction records
 
         for context_length in context_lengths:
             all_predictions, all_ground_truth, all_timestamps, all_sequence_ids = rolling_window_forecast(
@@ -168,14 +169,36 @@ def evaluate_single_patient(df, patient_name, pipeline, covariates, context_leng
             if len(all_predictions) == 0:
                 print(f"    Context {context_length}: NO valid predictions!")
                 patient_results[context_length] = None
+                per_forecast_by_ctx[context_length] = []
                 continue
 
             results = calculate_metrics(all_predictions, all_ground_truth, horizon_steps)
             patient_results[context_length] = results
 
+            # Flatten every (window, horizon_step) pair into one record per row.
+            # Window index here is just the order in which windows were emitted by rolling_window_forecast.
+            records = []
+            for w_idx, (preds, gts, tss, sid) in enumerate(
+                zip(all_predictions, all_ground_truth, all_timestamps, all_sequence_ids)
+            ):
+                for h_step, (p, g, t) in enumerate(zip(preds, gts, tss), start=1):
+                    records.append({
+                        "patient": patient_name,
+                        "sequence_id": int(sid),
+                        "window_idx": w_idx,
+                        "context_length": context_length,
+                        "horizon_step": h_step,
+                        "horizon_min": h_step * 5,  # 5-min sampling assumed
+                        "forecast_timestamp": t,
+                        "prediction": float(p),
+                        "ground_truth": float(g),
+                        "abs_error": float(abs(p - g)),
+                    })
+            per_forecast_by_ctx[context_length] = records
+
             print(f"    Context {context_length}: {len(all_predictions)} windows")
 
-        return patient_results
+        return patient_results, per_forecast_by_ctx
 
     except Exception as e:
         print(f"  Error processing {patient_name}: {e}")
@@ -267,7 +290,9 @@ def main(args):
         covariates = [c.strip() for c in args.covariates.split(",") if c.strip()]
     cov_sig = covariate_signature(covariates)
 
-    context_lengths = [144]
+    context_lengths = [int(c.strip()) for c in args.context_lengths.split(",") if c.strip()]
+    if not context_lengths:
+        raise ValueError("--context_lengths produced an empty list")
 
     print("Running zeroshot covariate eval")
     print(f"  run_name         : {args.run_name}")
@@ -275,8 +300,9 @@ def main(args):
     print(f"  covariates       : {covariates if covariates else '(univariate)'}")
     print(f"  output signature : {cov_sig}")
     print(f"  step_size        : {args.step_size}")
-    print(f"  prediction_length: {args.prediction_length}")
-    print(f"  context_lengths  : {context_lengths}")
+    print(f"  prediction_length: {args.prediction_length} steps ({args.prediction_length * 5} min)")
+    print(f"  context_lengths  : {context_lengths} steps ({[c * 5 for c in context_lengths]} min)")
+    print(f"  save_per_forecast: {args.save_per_forecast}")
 
     for dataset_name in datasets_to_run:
         data_dir = base_dir / dataset_name / "test"
@@ -291,6 +317,7 @@ def main(args):
         print("=" * 80)
 
         all_patient_results = {}
+        all_per_forecast = {ctx: [] for ctx in context_lengths}  # ctx -> list of records across patients
 
         for i, csv_path in enumerate(csv_files, 1):
             patient_name = csv_path.stem
@@ -298,7 +325,7 @@ def main(args):
 
             df = pd.read_csv(csv_path)
 
-            patient_results = evaluate_single_patient(
+            result = evaluate_single_patient(
                 df=df,
                 patient_name=patient_name,
                 pipeline=pipeline,
@@ -308,7 +335,14 @@ def main(args):
                 step_size=args.step_size,
             )
 
+            if result is None:
+                all_patient_results[patient_name] = None
+                continue
+
+            patient_results, patient_per_forecast = result
             all_patient_results[patient_name] = patient_results
+            for ctx, recs in patient_per_forecast.items():
+                all_per_forecast[ctx].extend(recs)
 
         summary_df = aggregate_results_across_patients(all_patient_results, context_lengths)
 
@@ -322,6 +356,17 @@ def main(args):
             context_lengths,
             output_dir=str(out_dir / "patient_results"),
         )
+
+        if args.save_per_forecast:
+            pf_dir = out_dir / "per_forecast"
+            pf_dir.mkdir(parents=True, exist_ok=True)
+            for ctx, recs in all_per_forecast.items():
+                if not recs:
+                    continue
+                pf_df = pd.DataFrame(recs)
+                pf_path = pf_dir / f"context_{ctx}.csv"
+                pf_df.to_csv(pf_path, index=False)
+                print(f"  per-forecast: {pf_path} ({len(pf_df)} rows)")
 
         print(f"Saved results to {out_dir}")
 
@@ -339,7 +384,15 @@ if __name__ == "__main__":
                         help="Output dir top-level under results_covariate/, e.g. 'zeroshot', "
                              "'finetune-lora-1e-4', 'zeroshot_v2'. Used to keep ablations separate "
                              "from fine-tuning runs.")
-    parser.add_argument("--step_size", type=int, default=1)
-    parser.add_argument("--prediction_length", type=int, default=18)
+    parser.add_argument("--step_size", type=int, default=1,
+                        help="Stride between rolling windows (in steps).")
+    parser.add_argument("--prediction_length", type=int, default=18,
+                        help="Forecast horizon in steps. Default 18 (=90min @ 5min sampling).")
+    parser.add_argument("--context_lengths", type=str, default="144",
+                        help="Comma-separated context lengths in steps. Default '144' (=12h @ 5min sampling). "
+                             "Multiple values run sequentially: e.g. '72,144,288' = 6h/12h/24h.")
+    parser.add_argument("--save_per_forecast", action=argparse.BooleanOptionalAction, default=True,
+                        help="Save per-window per-horizon predictions to per_forecast/context_{N}.csv. "
+                             "Use --no-save_per_forecast to skip (saves disk for very large step_size=1 runs).")
     args = parser.parse_args()
     main(args)
